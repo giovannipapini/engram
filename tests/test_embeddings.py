@@ -1,5 +1,7 @@
 """Tests for embeddings.py — multi-backend embedding and cross-encoder."""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -10,6 +12,32 @@ from engram.embeddings import (
 )
 
 
+def _local_backend_available() -> bool:
+    """True if any local embedding backend can actually run here."""
+    try:
+        import mlx.core  # noqa: F401
+        return True
+    except ImportError:
+        pass
+    from engram.embeddings import ONNX_MODEL_DIR
+    if os.path.isdir(ONNX_MODEL_DIR) and os.path.exists(
+            os.path.join(ONNX_MODEL_DIR, "model.onnx")):
+        return True
+    try:
+        import sentence_transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_local_backend = pytest.mark.skipif(
+    not _local_backend_available(),
+    reason="no local embedding backend (no mlx, no ONNX graph, no sentence-transformers)")
+
+
+@pytest.mark.skipif(
+    not _local_backend_available(),
+    reason="no local embedding backend (no mlx, no ONNX graph, no sentence-transformers)")
 class TestLocalEmbedding:
     def test_embed_query_shape(self):
         v = embed_query("test query")
@@ -35,6 +63,7 @@ class TestLocalEmbedding:
         assert sim < 0.9  # should not be identical
 
 
+@_local_backend
 class TestCosineSearch:
     def test_basic_search(self):
         docs = embed_documents(["cat", "dog", "physics", "quantum"])
@@ -60,7 +89,7 @@ class TestCosineSearch:
 class TestBackendDetection:
     def test_local_model_backend(self):
         backend = get_backend("BAAI/bge-small-en-v1.5")
-        assert backend in ("mlx", "sentence_transformers")
+        assert backend in ("mlx", "onnx", "sentence_transformers")
 
     def test_voyage_model_detected(self):
         assert get_backend("voyage-3.5") == "voyage"

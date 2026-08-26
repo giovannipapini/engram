@@ -157,6 +157,11 @@ def search(
     if config is None:
         config = Config.load()
 
+    # disabled cross-encoder → never attempt the CE path (upstream used to
+    # crash on CrossEncoder('') whenever candidates existed)
+    if rerank and not getattr(config, "cross_encoder_model", ""):
+        rerank = False
+
     rc = config.retrieval
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must be a nonempty string")

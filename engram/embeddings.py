@@ -1,15 +1,17 @@
 """Multi-backend embedding and cross-encoder reranking.
 
 Backends:
-  - auto: picks mlx > sentence_transformers for local models
+  - auto: picks mlx > onnx > sentence_transformers for local models
   - mlx: Apple Silicon GPU via MLX (local models only)
-  - sentence_transformers: CPU (local models only)
+  - onnx: CPU via onnxruntime against a pre-exported ONNX graph (local models
+    only; see ONNX_MODEL_DIR below) — no torch required at runtime
+  - sentence_transformers: CPU (local models only; optional extra [st])
   - voyage: Voyage AI API (voyage-3.5, voyage-3.5-lite, voyage-code-3, etc.)
   - openai: OpenAI API (text-embedding-3-small, text-embedding-3-large)
   - gemini: Google Gemini API (gemini-embedding-001)
 
 Configurable via config.yaml:
-  embedding_backend: auto | mlx | sentence_transformers | voyage | openai | gemini
+  embedding_backend: auto | mlx | onnx | sentence_transformers | voyage | openai | gemini
   embedding_model: BAAI/bge-small-en-v1.5  (local) | voyage-3.5 (API) | text-embedding-3-small (API)
   embedding_dim: 384  (auto-detected from model if not set)
 """
@@ -78,9 +80,21 @@ _bi_encoder = None
 _cross_encoders: dict[str, Any] = {}
 _mlx_model = None
 _mlx_tokenizer = None
+_onnx_encoder = None
 _backend = None
 _models_warmed = False
 _default_model = "BAAI/bge-small-en-v1.5"
+
+# Directory holding a pre-exported ONNX embedding graph + tokenizer.json
+# (the encoder of the embedding_model exported to ONNX). Used by the `onnx`
+# backend; also lets `auto` prefer onnx when the graph exists.
+ONNX_MODEL_DIR = os.environ.get(
+    "ENGRAM_ONNX_MODEL_DIR", "/app/models/bge-small-en-v1.5-onnx")
+ONNX_MAX_LEN = int(os.environ.get("ENGRAM_EMBED_MAX_LEN", "512"))
+ONNX_THREADS = int(os.environ.get("ENGRAM_ORT_THREADS", "2"))
+# Small batches: bulk embeds must not spike transient allocations on
+# memory-constrained hosts.
+ONNX_BATCH_SIZE = int(os.environ.get("ENGRAM_EMBED_BATCH", "16"))
 
 # known model → dim mappings (so we don't need a probe call)
 MODEL_DIMS = {
@@ -136,18 +150,22 @@ def _detect_backend(model_name: str | None = None) -> str:
     if _backend and _backend != "auto":
         return _backend
 
-    # auto-detect best local backend
+    # auto-detect best local backend: mlx > onnx (if graph present) > st
     try:
-        import mlx.core
+        import mlx.core  # noqa: F401
         return "mlx"
     except ImportError:
-        return "sentence_transformers"
+        pass
+    if os.path.isdir(ONNX_MODEL_DIR) and os.path.exists(
+            os.path.join(ONNX_MODEL_DIR, "model.onnx")):
+        return "onnx"
+    return "sentence_transformers"
 
 
 def set_backend(backend: str):
     """Override the embedding backend. Called during config init."""
     global _backend, _bi_encoder, _mlx_model, _mlx_tokenizer
-    valid = ("auto", "sentence_transformers", "mlx", "voyage", "openai", "gemini")
+    valid = ("auto", "sentence_transformers", "mlx", "onnx", "voyage", "openai", "gemini")
     if backend not in valid:
         raise ValueError(f"Unknown backend: {backend}. Use one of: {valid}")
     _backend = backend
@@ -173,6 +191,8 @@ def warmup(bi_model: str = "BAAI/bge-small-en-v1.5",
     backend = _detect_backend(bi_model)
     if backend == "mlx":
         _get_mlx_model(bi_model)
+    elif backend == "onnx":
+        _get_onnx_encoder()
     elif backend == "sentence_transformers":
         _get_bi_encoder(bi_model)
     # API backends don't need warmup
@@ -198,6 +218,72 @@ def _embed_st(texts: list[str], model_name: str, is_query: bool, normalize: bool
     embeddings = model.encode(texts, normalize_embeddings=normalize,
                                show_progress_bar=False, batch_size=256)
     return np.array(embeddings, dtype=np.float32)
+
+
+# ── ONNX backend (CPU, torch-free) ────────────────────────────────
+# Runs a pre-exported ONNX graph of the encoder (see export script in the
+# deployment image) via onnxruntime + tokenizers. CLS-pooled to mirror what
+# sentence-transformers produces from this repo's modules.json.
+
+def _get_onnx_encoder():
+    global _onnx_encoder
+    if _onnx_encoder is None:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        tokenizer = Tokenizer.from_file(
+            os.path.join(ONNX_MODEL_DIR, "tokenizer.json"))
+        tokenizer.no_padding()  # dynamic padding per batch in encode()
+        tokenizer.enable_truncation(max_length=ONNX_MAX_LEN)
+
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = ONNX_THREADS
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+        session = ort.InferenceSession(
+            os.path.join(ONNX_MODEL_DIR, "model.onnx"), sess_options=opts,
+            providers=["CPUExecutionProvider"])
+        input_names = [i.name for i in session.get_inputs()]
+        _onnx_encoder = (tokenizer, session, input_names)
+    return _onnx_encoder
+
+
+def _embed_onnx(texts: list[str], is_query: bool, normalize: bool) -> np.ndarray:
+    tokenizer, session, input_names = _get_onnx_encoder()
+    if is_query:
+        texts = [QUERY_PREFIX + t for t in texts]
+
+    out: list[np.ndarray] = []
+    for i in range(0, len(texts), ONNX_BATCH_SIZE):
+        chunk = texts[i:i + ONNX_BATCH_SIZE]
+        encs = [tokenizer.encode(t) for t in chunk]
+        max_len = max(len(e.ids) for e in encs)
+        ids = np.zeros((len(encs), max_len), dtype=np.int64)
+        mask = np.zeros_like(ids)
+        for j, e in enumerate(encs):
+            ids[j, :len(e.ids)] = e.ids
+            mask[j, :len(e.ids)] = e.attention_mask
+        feeds: dict[str, np.ndarray] = {}
+        for name in input_names:
+            if name == "input_ids":
+                feeds[name] = ids
+            elif name == "attention_mask":
+                feeds[name] = mask
+            elif name == "token_type_ids":
+                feeds[name] = np.zeros_like(ids)
+            else:
+                raise ValueError(f"unexpected ONNX model input: {name}")
+        hidden = session.run(None, feeds)[0]  # (B,S,H) last_hidden_state
+        # CLS pooling — matches sentence-transformers pooling_mode='cls'
+        out.append(hidden[:, 0, :].astype(np.float32))
+
+    vectors = np.concatenate(out, axis=0)
+    if normalize:
+        norms = np.maximum(np.linalg.norm(vectors, axis=-1, keepdims=True),
+                           1e-12)
+        vectors = vectors / norms
+    return vectors
 
 
 # ── MLX backend (Apple Silicon GPU) ─────────────────────────────
@@ -360,6 +446,8 @@ def embed_texts(texts: list[str], model_name: str | None = None,
         return _embed_gemini(texts, model, is_query, normalize)
     elif backend == "mlx":
         return _embed_mlx(texts, model, is_query, normalize)
+    elif backend == "onnx":
+        return _embed_onnx(texts, is_query, normalize)
     return _embed_st(texts, model, is_query, normalize)
 
 
@@ -399,6 +487,11 @@ def cross_encoder_rerank(query: str, documents: list[str],
 
     if model_name in RERANKER_BACKENDS:
         return _rerank_voyage(query, documents, model_name)
+
+    if not model_name:
+        # reranking disabled (cross_encoder_model: '') — keep input order
+        # instead of crashing on CrossEncoder('')
+        return list(enumerate([0.0] * len(documents)))
 
     # local cross-encoder
     import torch

@@ -103,7 +103,7 @@ class Config:
     postgres_dsn: str = ""
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     cross_encoder_model: str = "BAAI/bge-reranker-base"
-    embedding_backend: str = "auto"  # auto | mlx | sentence_transformers | voyage | openai | gemini
+    embedding_backend: str = "auto"  # auto | mlx | onnx | sentence_transformers | voyage | openai | gemini
     embedding_dim: int = 384
     hf_token: str = ""
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
@@ -291,7 +291,7 @@ _SECRETS = {"hf_token", "postgres_dsn", "llm.api_key", "web.auth_token"}
 _ENV_ALIASES = {"hf_token": ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")}
 _CONSTRAINTS = {
     "storage_backend": {"enum": ["sqlite", "postgres"], "normalize": "strip/lower"},
-    "embedding_backend": {"enum": ["auto", "mlx", "sentence_transformers", "voyage", "openai", "gemini"]},
+    "embedding_backend": {"enum": ["auto", "mlx", "onnx", "sentence_transformers", "voyage", "openai", "gemini"]},
     "llm.backend": {"enum": ["claude_cli", "mlx", "openai", "anthropic"]},
     "lifecycle.retention_mode": {"enum": ["l2", "huber", "elastic"]},
     "dormant_recall.mode": {"enum": ["off", "shadow"]},
@@ -332,7 +332,10 @@ _CONSTRAINTS = {
     "dormant_recall.log_max_events": {"minimum": 1, "maximum": 10000},
     "dormant_recall.log_retention_days": {"minimum": 1, "maximum": 365},
 }
-for _name in ("db_path", "embedding_model", "cross_encoder_model", "llm.model", "llm.mlx_model", "ann.index_path", "web.host"):
+# cross_encoder_model is deliberately excluded from the nonempty set: an empty
+# value disables reranking for torch-free deployments, and both warmup() and
+# search() treat a falsy model as "no cross-encoder".
+for _name in ("db_path", "embedding_model", "llm.model", "llm.mlx_model", "ann.index_path", "web.host"):
     _CONSTRAINTS[_name] = {"nonempty": True}
 
 _HELP = {
